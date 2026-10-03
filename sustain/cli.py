@@ -1,6 +1,6 @@
 """命令行入口：stdin 只接收 JSON，stdout 输出 JSON 审计结果。
 
-非法输入（含非 JSON、孤立 NOTE_OFF、重复踏板动作等）整份拒绝：
+非法输入（含非 JSON、孤立 NOTE_OFF、普通踏板/中踏板非法序列等）整份拒绝：
 向 stderr 输出 {"error": ...} 并以退出码 1 结束。
 """
 from __future__ import annotations

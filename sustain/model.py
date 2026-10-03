@@ -13,6 +13,8 @@ class EventType(str, Enum):
     NOTE_OFF = "NOTE_OFF"
     PEDAL_DOWN = "PEDAL_DOWN"
     PEDAL_UP = "PEDAL_UP"
+    SOSTENUTO_DOWN = "SOSTENUTO_DOWN"
+    SOSTENUTO_UP = "SOSTENUTO_UP"
 
 
 class KeyOffReason(str, Enum):
@@ -21,9 +23,10 @@ class KeyOffReason(str, Enum):
 
 
 class SoundEndReason(str, Enum):
-    NOTE_OFF = "NOTE_OFF"    # 松键时踏板未踩下，发声随即结束
-    PEDAL_UP = "PEDAL_UP"    # 松键后由踏板延音，抬踏板时结束
-    END_TIME = "END_TIME"    # 直到 endTime 仍在发声，被截断
+    NOTE_OFF = "NOTE_OFF"                # 松键时踏板未踩下，发声随即结束
+    PEDAL_UP = "PEDAL_UP"                # 松键后由普通延音踏板保持，抬该踏板时结束
+    SOSTENUTO_UP = "SOSTENUTO_UP"        # 松键后由中踏板捕获，抬中踏板时结束
+    END_TIME = "END_TIME"                # 直到 endTime 仍在发声，被截断
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class Note:
     key_off_reason: Optional[KeyOffReason] = None
     sound_end: Optional[Number] = None
     sound_end_reason: Optional[SoundEndReason] = None
+    sostenuto_captured: bool = False     # 被当前踩下的中踏板捕获的具体实例
+    sustain_pedal_holding: bool = False  # 松键后由普通延音踏板保持
 
     @property
     def sound_start(self) -> Number:

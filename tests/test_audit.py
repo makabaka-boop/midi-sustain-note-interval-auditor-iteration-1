@@ -1,7 +1,8 @@
 """以逐音符对象模型（Note dataclass）对拍审计结果。
 
-覆盖：同音重叠配对、踏板延音、跨通道隔离、同刻抬踏板的输入序语义、
-endTime 截断、孤立 NOTE_OFF / 重复踏板整份拒绝、峰值同时发声数。
+覆盖：同音重叠配对、普通延音踏板与中踏板、双踏板交叠、跨通道隔离、
+同刻踏板输入序语义、endTime 截断、孤立 NOTE_OFF / 重复踏板整份拒绝、
+峰值同时发声数。
 """
 import io
 import json
@@ -23,6 +24,7 @@ KOFF = KeyOffReason.NOTE_OFF
 KEND = KeyOffReason.END_TIME
 SOFF = SoundEndReason.NOTE_OFF
 SPEDAL = SoundEndReason.PEDAL_UP
+SSOST = SoundEndReason.SOSTENUTO_UP
 SEND = SoundEndReason.END_TIME
 
 
@@ -42,6 +44,14 @@ def pd(t, ch=0):
 
 def pu(t, ch=0):
     return {"time": t, "type": "PEDAL_UP", "channel": ch}
+
+
+def sd(t, ch=0):
+    return {"time": t, "type": "SOSTENUTO_DOWN", "channel": ch}
+
+
+def su(t, ch=0):
+    return {"time": t, "type": "SOSTENUTO_UP", "channel": ch}
 
 
 def payload(events, end_time):
@@ -87,6 +97,148 @@ class TestPedalSemantics:
             [on(0), pd(1), off(2), pu(3), pd(4), pu(5)],
             end_time=5))
         assert r.notes == [note(0, 0, 60, 0, 2, KOFF, 3, SPEDAL)]
+
+
+# ---------- 中踏板：只捕获踩下瞬间仍按住的具体音符实例 ----------
+
+class TestSostenutoSemantics:
+    def test_sostenuto_holds_released_note_until_sostenuto_up(self):
+        r = audit(payload([on(0), sd(1), off(2), su(5)], end_time=5))
+        assert r.notes == [note(0, 0, 60, 0, 2, KOFF, 5, SSOST)]
+        assert r.peak_concurrent == 1
+
+    def test_sostenuto_does_not_capture_note_already_released_by_pedal(self):
+        # SD 时该音已经松键，只存在于普通踏板延音列表，不能被中踏板捕获。
+        r = audit(payload(
+            [pd(0), on(1), off(2), sd(3), pu(4), su(5)],
+            end_time=5))
+        assert r.notes == [note(0, 0, 60, 1, 2, KOFF, 4, SPEDAL)]
+
+    def test_sostenuto_does_not_capture_new_note_after_down(self):
+        # SD 后才弹的新音不被捕获；无普通踏板时 OFF 立即结束。
+        r = audit(payload([sd(0), on(1), off(2), su(3)], end_time=3))
+        assert r.notes == [note(0, 0, 60, 1, 2, KOFF, 2, SOFF)]
+
+    def test_sostenuto_up_keeps_still_held_note_sounding(self):
+        r = audit(payload([on(0), sd(1), su(2), off(3)], end_time=3))
+        assert r.notes == [note(0, 0, 60, 0, 3, KOFF, 3, SOFF)]
+
+    def test_damper_pedal_takes_over_captured_released_note(self):
+        # 中踏板先捕获，普通踏板之后也踩下；先抬普通踏板时音仍由中踏板保持。
+        r = audit(payload(
+            [on(0), sd(1), pd(2), off(3), pu(4), su(5)],
+            end_time=5))
+        assert r.notes == [note(0, 0, 60, 0, 3, KOFF, 5, SSOST)]
+
+    def test_damper_pedal_reapply_does_not_duplicate_captured_note(self):
+        r = audit(payload(
+            [on(0), sd(1), off(2),
+             pd(3), pu(4), pd(5), pu(6),
+             su(7)],
+            end_time=7))
+        assert r.notes == [note(0, 0, 60, 0, 2, KOFF, 7, SSOST)]
+
+    def test_sostenuto_release_first_leaves_damper_holding(self):
+        # 两种保持同时生效；先抬中踏板不结束，普通踏板抬起时才以 PEDAL_UP 结束。
+        r = audit(payload(
+            [on(0), sd(1), pd(2), off(3), su(4), pu(5)],
+            end_time=5))
+        assert r.notes == [note(0, 0, 60, 0, 3, KOFF, 5, SPEDAL)]
+
+    def test_same_timestamp_pedal_up_order_selects_end_reason(self):
+        base = [on(0), sd(1), pd(2), off(3)]
+
+        r_damper_first = audit(payload(base + [pu(5), su(5)], end_time=5))
+        assert r_damper_first.notes[0].sound_end_reason is SSOST
+
+        r_sostenuto_first = audit(payload(base + [su(5), pu(5)], end_time=5))
+        assert r_sostenuto_first.notes[0].sound_end_reason is SPEDAL
+
+    def test_same_timestamp_off_and_sostenuto_down_order(self):
+        # OFF 先发生时音已结束，随后同刻 SD 不能复活该实例。
+        r = audit(payload([on(0), off(1), sd(1), su(2)], end_time=2))
+        assert r.notes == [note(0, 0, 60, 0, 1, KOFF, 1, SOFF)]
+
+        # SD 先发生则捕获该仍按住实例，同刻 OFF 后继续由中踏板保持。
+        r = audit(payload([on(0), sd(1), off(1), su(2)], end_time=2))
+        assert r.notes == [note(0, 0, 60, 0, 1, KOFF, 2, SSOST)]
+
+    def test_same_timestamp_sostenuto_up_and_off_order(self):
+        # SU 先解除捕获，随后同刻 OFF 时已无踏板，按 NOTE_OFF 立即结束。
+        r = audit(payload([on(0), sd(1), su(2), off(2)], end_time=2))
+        assert r.notes == [note(0, 0, 60, 0, 2, KOFF, 2, SOFF)]
+
+        # OFF 先转入中踏板保持，随后同刻 SU 才结束它。
+        r = audit(payload([on(0), sd(1), off(2), su(2)], end_time=2))
+        assert r.notes == [note(0, 0, 60, 0, 2, KOFF, 2, SSOST)]
+
+    def test_same_pitch_retrigger_uses_fifo_and_captures_exact_instance(self):
+        r = audit(payload(
+            [on(0), sd(1), on(2), off(3), su(4), off(5)],
+            end_time=5))
+        assert r.notes == [
+            # 第一个 OFF 仍配对最早仍按住的实例；只有该实例在 SD 时已存在。
+            note(0, 0, 60, 0, 3, KOFF, 4, SSOST),
+            # SD 后的新实例未捕获；SU 后仍按住，最终自己的 OFF 立即结束。
+            note(1, 0, 60, 2, 5, KOFF, 5, SOFF),
+        ]
+        assert r.peak_concurrent == 2
+
+    def test_sostenuto_is_per_channel(self):
+        r = audit(payload(
+            [on(0, ch=0), on(0, ch=1),
+             sd(1, ch=0),
+             off(2, ch=0),       # ch0 由中踏板保持
+             off(2, ch=1),       # ch1 无任何踏板 → 立即结束
+             su(3, ch=0)],
+            end_time=3))
+        assert r.notes == [
+            note(0, 0, 60, 0, 2, KOFF, 3, SSOST),
+            note(1, 1, 60, 0, 2, KOFF, 2, SOFF),
+        ]
+        assert r.peak_concurrent == 2
+
+    def test_two_pedals_are_independent_across_channels(self):
+        r = audit(payload(
+            [on(0, ch=0, p=60), on(0, ch=1, p=64),
+             pd(1, ch=0), sd(1, ch=1),
+             off(2, ch=0, p=60), off(2, ch=1, p=64),
+             pu(3, ch=0), su(4, ch=1)],
+            end_time=4))
+        assert r.notes == [
+            note(0, 0, 60, 0, 2, KOFF, 3, SPEDAL),
+            note(1, 1, 64, 0, 2, KOFF, 4, SSOST),
+        ]
+        assert r.peak_concurrent == 2
+
+    def test_captured_sostenuto_notes_count_in_peak_concurrent(self):
+        r = audit(payload(
+            [on(0, p=60), on(1, p=62),
+             sd(2),
+             off(3, p=60), off(4, p=62),
+             su(7)],
+            end_time=7))
+        assert r.peak_concurrent == 2
+
+    def test_captured_note_truncated_at_end_time(self):
+        r = audit(payload([on(0), sd(1), off(2)], end_time=10))
+        assert r.notes == [note(0, 0, 60, 0, 2, KOFF, 10, SEND)]
+
+    def test_repeated_sostenuto_down_rejected(self):
+        with pytest.raises(AuditError, match="repeated SOSTENUTO_DOWN"):
+            audit(payload([sd(0), sd(1)], end_time=2))
+
+    def test_sostenuto_up_without_down_rejected(self):
+        with pytest.raises(AuditError, match="sostenuto pedal is not down"):
+            audit(payload([su(0)], end_time=1))
+
+    def test_sostenuto_state_is_per_channel_for_rejection(self):
+        with pytest.raises(AuditError, match="sostenuto pedal is not down"):
+            audit(payload([sd(0, ch=0), su(1, ch=1)], end_time=2))
+
+    def test_invalid_sostenuto_sequence_leaves_no_partial_output(self):
+        with pytest.raises(AuditError):
+            audit(payload([on(0), sd(1), off(2), sd(3)], end_time=4))
 
 
 # ---------- 同音重叠：多个 NOTE_ON 排队配对 ----------
