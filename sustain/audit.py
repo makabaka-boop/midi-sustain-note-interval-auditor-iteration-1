@@ -3,8 +3,15 @@
 语义约定：
 - 事件按 time 非降序排列；同一时刻的事件严格按输入顺序执行。
 - NOTE_OFF 释放该通道该音高“最早仍按住”的 NOTE_ON（同音重叠时排队配对）。
-- 踏板踩下期间 NOTE_OFF 只释放琴键，音符转入延音；抬踏板时结束该通道
-  全部已松键的延音音符，仍按住的音符不受影响。
+- 普通踏板（PEDAL_DOWN/UP）踩下期间 NOTE_OFF 只释放琴键，音符转入延音；
+  抬踏板时结束该通道全部已由它保持的已松键音符，仍按住的音符不受影响。
+- 中踏板（SOSTENUTO_DOWN/UP，每通道独立）在踩下瞬间只捕获该通道当时仍被
+  琴键按住的音符实例：此后新弹的音、以及此前已松键仅靠普通踏板发声的音
+  都不被捕获。被捕获的音符松键后由中踏板继续保持，直到 SOSTENUTO_UP。
+- 两种踏板都只保持各自捕获的音符，互不追溯：普通踏板不接手已靠中踏板
+  发声的音，中踏板也不捕获已靠普通踏板发声的音。一个已松键音符可同时
+  被两者保持；只要任一保持仍生效就继续发声，两种保持都解除时才结束，
+  结束原因由后处理的那次抬踏板决定。
 - endTime 不早于末事件；所有剩余发声音符在 endTime 截断并标记原因。
 - 孤立 NOTE_OFF、重复踏板动作等任何非法情况均整份拒绝（抛 AuditError）。
 """
@@ -114,8 +121,10 @@ def audit(payload: Any) -> AuditResult:
 
     notes: List[Note] = []
     held: Dict[Tuple[int, int], Deque[Note]] = defaultdict(deque)  # 仍按住
-    sustained: Dict[int, List[Note]] = defaultdict(list)           # 已松键、踏板延音中
+    sustained: Dict[int, List[Note]] = defaultdict(list)  # 已松键、普通踏板保持中
+    captured: Dict[int, List[Note]] = defaultdict(list)   # 被中踏板锁住的音符
     pedal_down = [False] * 16
+    sostenuto_down = [False] * 16
 
     for ev in events:
         if ev.type is EventType.NOTE_ON:
@@ -134,10 +143,11 @@ def audit(payload: Any) -> AuditResult:
             note = queue.popleft()  # 最早仍按住的同音 NOTE_ON
             note.key_off = ev.time
             note.key_off_reason = KeyOffReason.NOTE_OFF
-            if pedal_down[ev.channel]:
-                sustained[ev.channel].append(note)  # 只松键，不结束发声
-            else:
-                note.sound_end = ev.time
+            note.pedal_held = pedal_down[ev.channel]
+            if note.pedal_held:
+                sustained[ev.channel].append(note)  # 普通踏板接手保持
+            if not note.pedal_held and not note.sostenuto_held:
+                note.sound_end = ev.time            # 无任何保持 → 立即结束
                 note.sound_end_reason = SoundEndReason.NOTE_OFF
 
         elif ev.type is EventType.PEDAL_DOWN:
@@ -155,9 +165,43 @@ def audit(payload: Any) -> AuditResult:
                 )
             pedal_down[ev.channel] = False
             for note in sustained[ev.channel]:
-                note.sound_end = ev.time
-                note.sound_end_reason = SoundEndReason.PEDAL_UP
+                note.pedal_held = False
+                if not note.sostenuto_held:  # 中踏板仍锁住 → 继续发声
+                    note.sound_end = ev.time
+                    note.sound_end_reason = SoundEndReason.PEDAL_UP
             sustained[ev.channel].clear()
+
+        elif ev.type is EventType.SOSTENUTO_DOWN:
+            if sostenuto_down[ev.channel]:
+                raise AuditError(
+                    f"repeated SOSTENUTO_DOWN at time {ev.time}"
+                    f" on channel {ev.channel}"
+                )
+            sostenuto_down[ev.channel] = True
+            # 只捕获此刻仍被琴键按住的音符实例；已松键（仅靠普通踏板发声）
+            # 的和此后新弹的都不被捕获。
+            for (ch, _pitch), queue in held.items():
+                if ch != ev.channel:
+                    continue
+                for note in queue:
+                    note.sostenuto_held = True
+                    captured[ev.channel].append(note)
+
+        elif ev.type is EventType.SOSTENUTO_UP:
+            if not sostenuto_down[ev.channel]:
+                raise AuditError(
+                    f"SOSTENUTO_UP at time {ev.time} on channel {ev.channel}"
+                    " while sostenuto is not down"
+                )
+            sostenuto_down[ev.channel] = False
+            for note in captured[ev.channel]:
+                note.sostenuto_held = False
+                # 已松键且普通踏板未保持 → 由这次抬中踏板结束；
+                # 仍按住或仍被普通踏板保持的音符不受影响。
+                if note.key_off is not None and not note.pedal_held:
+                    note.sound_end = ev.time
+                    note.sound_end_reason = SoundEndReason.SOSTENUTO_UP
+            captured[ev.channel].clear()
 
     # endTime 截断：仍未松键 / 仍在发声的音符
     for note in notes:
