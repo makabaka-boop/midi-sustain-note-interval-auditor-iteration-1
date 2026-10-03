@@ -1,0 +1,15 @@
+services:
+  # 命令行审计器：stdin 接收 JSON，stdout 输出审计结果
+  # 用法：docker compose run --rm -T sustain < examples/sample.json
+  sustain:
+    build:
+      context: .
+      target: base
+    stdin_open: true
+
+  # 测试服务：docker compose --profile test run --rm sustain-test
+  sustain-test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]

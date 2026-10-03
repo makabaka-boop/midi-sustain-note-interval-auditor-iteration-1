@@ -1,0 +1,9 @@
+[project]
+name = "sustain-auditor"
+version = "1.0.0"
+description = "钢琴事件流踏板审计器：JSON 进，逐音符按键/发声区间与峰值并发数出"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
